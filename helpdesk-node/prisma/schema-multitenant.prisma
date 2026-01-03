@@ -1,0 +1,512 @@
+// Multi-Tenant Prisma Schema for Helpdesk SaaS
+// This schema supports both control plane (public schema) and tenant schemas
+
+generator client {
+  provider = "prisma-client-js"
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["public", "tenant"]
+}
+
+// ============================================
+// CONTROL PLANE MODELS (Public Schema)
+// These manage the SaaS platform itself
+// ============================================
+
+// Control Plane User (SaaS Account Owner)
+model ControlUser {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String   @map("password_hash")
+  fullName      String   @map("full_name")
+  role          String   @default("owner") // owner, billing
+  emailVerified Boolean  @default(false) @map("email_verified")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenants       Tenant[]
+  refreshTokens ControlRefreshToken[]
+
+  @@index([email])
+  @@map("control_users")
+  @@schema("public")
+}
+
+model ControlRefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String   @map("user_id")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user ControlUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("control_refresh_tokens")
+  @@schema("public")
+}
+
+// Tenant (Organization/Company Instance)
+model Tenant {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id") // Control user who owns this tenant
+  companyName String   @map("company_name")
+  subdomain   String   @unique
+  schemaName  String   @unique @map("schema_name") // e.g., tenant_abc123
+  plan        String   // free, starter, professional, enterprise
+  status      String   @default("provisioning") // provisioning, active, suspended, deleted
+
+  // Contact & Settings
+  contactEmail String?  @map("contact_email")
+  logoUrl      String?  @map("logo_url")
+  customDomain String?  @unique @map("custom_domain")
+
+  // Timestamps
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+  suspendedAt  DateTime? @map("suspended_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  // Relations
+  owner        ControlUser  @relation(fields: [userId], references: [id])
+  credits      Credits?
+  usageLogs    UsageLog[]
+  transactions Transaction[]
+
+  @@index([subdomain])
+  @@index([userId])
+  @@index([status])
+  @@map("tenants")
+  @@schema("public")
+}
+
+// Credits & Billing
+model Credits {
+  id        String   @id @default(uuid())
+  tenantId  String   @unique @map("tenant_id")
+  balance   Float    @default(0) // Current credit balance
+  plan      String   // Current plan: free, starter, professional, enterprise
+
+  // Limits based on plan
+  monthlyAllocation Float @default(0) @map("monthly_allocation") // Credits allocated per month
+  resetAt          DateTime @map("reset_at") // When credits reset (monthly)
+
+  // Billing
+  billingCycle     String @default("monthly") @map("billing_cycle") // monthly, annual
+  nextBillingDate  DateTime? @map("next_billing_date")
+
+  // Stripe
+  stripeCustomerId       String? @unique @map("stripe_customer_id")
+  stripeSubscriptionId   String? @unique @map("stripe_subscription_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("credits")
+  @@schema("public")
+}
+
+// Usage Tracking (for metering)
+model UsageLog {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  action    String   // create_ticket, add_comment, upload_file, send_email, api_call
+  resource  String?  // ticket_id, comment_id, etc.
+  credits   Float    // Credits consumed for this action
+  metadata  Json?    // Additional context
+  timestamp DateTime @default(now())
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, timestamp])
+  @@index([action])
+  @@map("usage_logs")
+  @@schema("public")
+}
+
+// Financial Transactions
+model Transaction {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  type      String   // purchase, refund, subscription, bonus
+  amount    Int      // Amount in cents (e.g., $50.00 = 5000)
+  credits   Float    // Credits added/deducted
+  currency  String   @default("USD")
+  status    String   @default("pending") // pending, completed, failed, refunded
+
+  // Payment Gateway
+  stripePaymentId       String? @map("stripe_payment_id")
+  stripePaymentIntentId String? @map("stripe_payment_intent_id")
+
+  // Metadata
+  description String?
+  metadata    Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("transactions")
+  @@schema("public")
+}
+
+// Subscription Plans (Reference Data)
+model Plan {
+  id          String   @id @default(uuid())
+  name        String   @unique // free, starter, professional, enterprise
+  displayName String   @map("display_name") // "Free Tier", "Starter Plan"
+  description String?
+
+  // Pricing
+  priceMonthly  Int      @map("price_monthly") // In cents
+  priceAnnual   Int?     @map("price_annual") // In cents
+
+  // Credits
+  creditsMonthly Float   @map("credits_monthly") // Monthly allocation
+  creditsAnnual  Float?  @map("credits_annual") // Annual allocation (if different)
+
+  // Limits
+  maxAgents      Int?    @map("max_agents") // null = unlimited
+  maxTickets     Int?    @map("max_tickets") // per month, null = unlimited
+  maxStorage     Int?    @map("max_storage") // in MB, null = unlimited
+
+  // Features
+  features       Json    // Array of feature flags
+
+  // Stripe
+  stripePriceIdMonthly String? @map("stripe_price_id_monthly")
+  stripePriceIdAnnual  String? @map("stripe_price_id_annual")
+
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("plans")
+  @@schema("public")
+}
+
+// Invitation System (for team members)
+model Invitation {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  email     String
+  role      String   // admin, agent
+  token     String   @unique
+  status    String   @default("pending") // pending, accepted, expired
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  acceptedAt DateTime? @map("accepted_at")
+
+  @@index([tenantId])
+  @@index([email])
+  @@index([token])
+  @@map("invitations")
+  @@schema("public")
+}
+
+// ============================================
+// TENANT MODELS (Tenant Schemas)
+// These are duplicated per tenant in separate schemas
+// ============================================
+
+// User Management (Tenant Users - not Control Users)
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  password      String
+  fullName      String   @map("full_name")
+  userType      UserType @default(CUSTOMER) @map("user_type")
+  isActive      Boolean  @default(true) @map("is_active")
+  userImage     String?  @map("user_image")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  agent              Agent?
+  customer           Customer?
+  ticketsRaised      Ticket[]           @relation("TicketRaisedBy")
+  ticketsAssigned    Ticket[]           @relation("TicketAssignedTo")
+  comments           Comment[]
+  activities         Activity[]
+  notifications      Notification[]
+  articlesAuthored   Article[]
+  refreshTokens      RefreshToken[]
+
+  @@map("users")
+  @@schema("tenant")
+}
+
+enum UserType {
+  AGENT
+  CUSTOMER
+  ADMIN
+
+  @@schema("tenant")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String   @map("user_id")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("refresh_tokens")
+  @@schema("tenant")
+}
+
+// Agent & Team Management
+model Agent {
+  id        String   @id @default(uuid())
+  userId    String   @unique @map("user_id")
+  agentName String   @map("agent_name")
+  teamId    String?  @map("team_id")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team Team? @relation(fields: [teamId], references: [id])
+
+  @@map("agents")
+  @@schema("tenant")
+}
+
+model Team {
+  id          String   @id @default(uuid())
+  teamName    String   @unique @map("team_name")
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  agents  Agent[]
+  tickets Ticket[]
+
+  @@map("teams")
+  @@schema("tenant")
+}
+
+// Customer Management
+model Customer {
+  id           String   @id @default(uuid())
+  userId       String   @unique @map("user_id")
+  customerName String   @map("customer_name")
+  mobileNo     String?  @map("mobile_no")
+  organization String?
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tickets Ticket[]
+
+  @@map("customers")
+  @@schema("tenant")
+}
+
+// Ticket System
+model Ticket {
+  id               String        @id @default(uuid())
+  subject          String
+  description      String?       @db.Text
+  status           String        @default("Open")
+  priority         TicketPriority? @default(MEDIUM)
+  ticketType       String?       @map("ticket_type")
+
+  customerId       String        @map("customer_id")
+  raisedById       String        @map("raised_by_id")
+  assignedToId     String?       @map("assigned_to_id")
+  teamId           String?       @map("team_id")
+
+  responseBy       DateTime?     @map("response_by")
+  resolutionBy     DateTime?     @map("resolution_by")
+  firstRespondedOn DateTime?     @map("first_responded_on")
+  resolutionDate   DateTime?     @map("resolution_date")
+
+  resolution       String?       @db.Text
+  ticketKey        String        @unique @default(uuid()) @map("ticket_key")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  raisedBy     User          @relation("TicketRaisedBy", fields: [raisedById], references: [id])
+  assignedTo   User?         @relation("TicketAssignedTo", fields: [assignedToId], references: [id])
+  team         Team?         @relation(fields: [teamId], references: [id])
+  comments     Comment[]
+  activities   Activity[]
+  attachments  Attachment[]
+
+  @@index([customerId])
+  @@index([assignedToId])
+  @@index([status])
+  @@index([priority])
+  @@index([createdAt])
+  @@map("tickets")
+  @@schema("tenant")
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+
+  @@schema("tenant")
+}
+
+model Comment {
+  id         String   @id @default(uuid())
+  ticketId   String   @map("ticket_id")
+  userId     String   @map("user_id")
+  content    String   @db.Text
+  isInternal Boolean  @default(false) @map("is_internal")
+  isPinned   Boolean  @default(false) @map("is_pinned")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  ticket      Ticket       @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  user        User         @relation(fields: [userId], references: [id])
+  attachments Attachment[]
+
+  @@index([ticketId])
+  @@map("comments")
+  @@schema("tenant")
+}
+
+model Activity {
+  id        String   @id @default(uuid())
+  ticketId  String   @map("ticket_id")
+  userId    String   @map("user_id")
+  action    String
+  fieldName String?  @map("field_name")
+  oldValue  String?  @map("old_value")
+  newValue  String?  @map("new_value")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id])
+
+  @@index([ticketId])
+  @@map("activities")
+  @@schema("tenant")
+}
+
+model Attachment {
+  id         String   @id @default(uuid())
+  fileName   String   @map("file_name")
+  fileUrl    String   @map("file_url")
+  fileSize   Int      @map("file_size")
+  mimeType   String   @map("mime_type")
+  ticketId   String?  @map("ticket_id")
+  commentId  String?  @map("comment_id")
+  uploadedBy String   @map("uploaded_by")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  ticket  Ticket?  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  comment Comment? @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@map("attachments")
+  @@schema("tenant")
+}
+
+// Knowledge Base
+model Article {
+  id          String        @id @default(uuid())
+  title       String
+  content     String        @db.Text
+  categoryId  String        @map("category_id")
+  authorId    String        @map("author_id")
+  status      ArticleStatus @default(DRAFT)
+  views       Int           @default(0)
+  isPublished Boolean       @default(false) @map("is_published")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  category Category @relation(fields: [categoryId], references: [id])
+  author   User     @relation(fields: [authorId], references: [id])
+
+  @@index([categoryId])
+  @@index([status])
+  @@map("articles")
+  @@schema("tenant")
+}
+
+enum ArticleStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+
+  @@schema("tenant")
+}
+
+model Category {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  parentId    String?  @map("parent_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  parent   Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryHierarchy")
+  articles Article[]
+
+  @@map("categories")
+  @@schema("tenant")
+}
+
+// Notifications
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  title     String
+  message   String
+  type      String
+  isRead    Boolean  @default(false) @map("is_read")
+  link      String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@map("notifications")
+  @@schema("tenant")
+}
+
+// SLA & Configuration
+model SLA {
+  id               String   @id @default(uuid())
+  name             String   @unique
+  priority         String
+  responseTime     Int      @map("response_time")
+  resolutionTime   Int      @map("resolution_time")
+  isActive         Boolean  @default(true) @map("is_active")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@map("slas")
+  @@schema("tenant")
+}
+
+model Settings {
+  id    String @id @default(uuid())
+  key   String @unique
+  value String @db.Text
+
+  @@map("settings")
+  @@schema("tenant")
+}
