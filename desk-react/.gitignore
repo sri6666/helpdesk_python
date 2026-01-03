@@ -26,3 +26,4 @@ coverage/
 
 # Playwright
 playwright/.cache/
+dump.rdb
